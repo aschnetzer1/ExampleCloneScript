@@ -1,0 +1,645 @@
+local module = {}
+
+local player = game.Players.LocalPlayer
+
+-- [[ Services ]]
+local services = require(player.PlayerScripts:WaitForChild("Modules"):WaitForChild("services"))
+local repStorage = services.replicatedStorage
+local TweenService = services.tweenService
+
+-- [[ Remotes Defined ]]
+local npcTableRemote = repStorage:WaitForChild("Remotes"):WaitForChild("npcTables")
+
+-- [[ Modules ]]
+local utils = require(repStorage:WaitForChild("Modules"):WaitForChild("robloxUtilities"))
+local gameUtils = require(repStorage.Modules:WaitForChild("gameUtilities"))
+
+
+-- [[ Variables ]]
+local npcTable = {["car"] = {}, ["customer"] ={}, ["worker"]={}} --players npcs
+local playerVisiting = nil
+local npcVisitingTable = {}
+
+-- local handling of own assets 
+function module:addNpc(npcType, npc, npcObject)
+	local openSpot = false
+	for j,k in pairs(npcTable[npcType]) do
+		if k == "x" then -- an already used and removed spot
+			openSpot = true
+			npc["id"] = tonumber(j)
+			npcObject:SetAttribute("id", tonumber(j)) -- change id to replicated id
+			npcTable[npcType][j] = npc
+			npcTableRemote:FireServer("addNpc", npcType, npc)
+			return true
+		end
+	end
+	
+	if not openSpot then
+		npc["id"] = #npcTable[npcType] + 1	
+		npcObject:SetAttribute("id", #npcTable[npcType] + 1)
+		--table.insert(npcTable[npcType], npc )--npc) -- old
+		npcTable[npcType][npc["id"]] = npc
+		npcTableRemote:FireServer("addNpc", npcType, npc)
+	end
+	-- fire npcTableServer
+end
+
+function module:updateNpc(npcType, index, key, value, anim, tweenToNext)
+	local position = nil
+
+	for i,k in pairs(npcTable[npcType]) do 
+		--print(npcTable[npcType][i]["npc"]:GetAttribute("id"), index:GetAttribute("id"))
+		if index and npcTable[npcType][i]["npc"] then
+			if npcTable[npcType][i]["npc"]:GetAttribute("id") == index:GetAttribute("id") then
+				-- found correct field to update
+				position = i
+				break
+			end
+		end
+	end
+	
+	if position then	
+		npcTable[npcType][position][key] = value
+		npcTable[npcType][position]["flagChange"] = key
+		npcTableRemote:FireServer("updateNpc", npcType, position, key, value, anim, tweenToNext)
+		return true
+	else
+		warn("did not find correct npc") -- REVIEW LATER
+		return false
+	end
+end
+
+function module:removeNpc(npcType, index)
+	local position = nil
+	for i,k in pairs(npcTable[npcType]) do 
+		if npcTable[npcType][i]["npc"] == index then
+			-- found correct field to update
+			position = i
+			break
+		end
+	end
+
+	if position then	
+		npcTable[npcType][position] = "x"
+		npcTableRemote:FireServer("removeNpc", npcType, position)
+		return true
+	else
+		return false
+	end	
+end
+
+function module.updatelift(lift, carId, state)
+	npcTableRemote:FireServer("updateLift", lift, carId, state)
+end
+
+function module:updatesFromOthers(otherPlayerId,npcType,position,key,value, anim, tweenToNext)
+
+	if key == "action" then
+		if value == "fillCar" then
+			npcVisitingTable["car"][position]["filled"] = true
+			module:remoteFillCar(position, otherPlayerId)
+		end
+		if value == "emptyCar" then
+			module:remoteEmptyCar(position, otherPlayerId)
+		end
+		if value == "stopWalkStartIdle" then
+			npcVisitingTable["customer"][position]["animation"] = "idle"
+			module:remoteUpdateAnim(npcType, position, "drive", false) -- stop drive animations 
+			module:remoteUpdateAnim(npcType, position, "sit", false)  -- stop sit animations
+			module:remoteUpdateAnim(npcType, position, "walk", "idle") 
+		end
+		if value == "stopRumble" then -- stop rumble and fumes
+			local car = workspace.cars[otherPlayerId][tostring(position)]
+			car:SetAttribute("state", "working")
+
+			local floor = npcVisitingTable["car"][position]["floor"] -- ensure car is fully in garage spot 
+			local bay = npcVisitingTable["car"][position]["bay"]
+			
+			local garage = gameUtils.getGarageByUserId(otherPlayerId)
+			
+			if garage then -- ensure car is fully in garage spot 
+				if (car:GetPrimaryPartCFrame().Position - garage.floors[floor][bay].entryPath["4"].Position).Magnitude > 5 then
+					car:SetPrimaryPartCFrame(garage.floors[floor][bay].entryPath["4"].CFrame + Vector3.new(0,garage.floors[floor][bay].entryPath["4"].heightPlus.Value,0))
+				end
+			end
+			
+			module:remoteUpdateAnim(npcType, position, "rumble", nil) 
+			for j,k in pairs(workspace.cars[otherPlayerId][tostring(position)]:GetChildren()) do
+				if k.Name == "muffler" and k:FindFirstChild("Attachment") and k.Attachment:FindFirstChild("exhaustFumesBad") then
+					k.Attachment.exhaustFumesBad.Enabled = false
+				end
+			end
+		end
+		--if value == "mechanicFix" then
+		--	npcVisitingTable["worker"][position]["animation"] = "wrench"
+		--	module:remoteUpdateAnim(npcType, position, "walk", "wrench") 
+		--end
+		--if value == "mechanicEnd" then
+		--	npcVisitingTable["worker"][position]["animation"] = "sweep"
+		--	module:remoteUpdateAnim(npcType, position, "walk", "sweep")
+		--end
+		
+		if value == "removeCar" then 
+			for _,k in ipairs(npcVisitingTable["customer"]) do -- remove all passengers in car 
+				if k["carId"] and tonumber(k["carId"]) == tonumber(position) then
+					workspace.npc[otherPlayerId][tostring(k["id"])]:Destroy()
+					k = "x" --nil
+				end
+			end
+			npcVisitingTable["car"][position] = "x"
+			workspace.cars[otherPlayerId][position]:Destroy()
+		end
+	end
+	
+	if key == "refillCar" then
+		npcVisitingTable["customer"][position]["sit"]:Stop() -- FOR LATER change animation to be changed from "waiting/sitting/idleWait"
+		workspace.npc[otherPlayerId][tostring(position)]:SetPrimaryPartCFrame(value)
+		--weld to seat
+		if workspace.npc[otherPlayerId][tostring(position)].PrimaryPart:FindFirstChild("ManualWeld") then
+			workspace.npc[otherPlayerId][tostring(position)].PrimaryPart.ManualWeld.Part0 = workspace.npc[otherPlayerId][tostring(position)].PrimaryPart
+		else 
+			-- create 
+			local weld = utils:weldBetween(workspace.npc[otherPlayerId][tostring(position)].PrimaryPart, workspace.cars[otherPlayerId][tostring(npcVisitingTable["customer"][position]["carId"])].PrimaryPart)
+		end
+		workspace.npc[otherPlayerId][tostring(position)].PrimaryPart.Anchored = false
+	end
+
+
+	if key == "CFrame" then
+		if npcType and (npcType) == "car" then
+			if anim and npcVisitingTable["car"][position][anim] then 
+				npcVisitingTable["car"][position][anim]:Play()
+			end
+			if tweenToNext then
+				-- if tween to next and car not filled then call remoteFillCar
+				if npcVisitingTable["car"][position]["filled"] == false then
+					npcVisitingTable["car"][position]["filled"] = true
+					module:remoteFillCar(position, otherPlayerId)
+				end
+				if not npcVisitingTable["car"][position]["rumble"].IsPlaying then 
+					npcVisitingTable["car"][position]["rumble"]:Play()
+					-- add smoke effect 
+				end
+				for j,k in pairs(workspace.cars[otherPlayerId][tostring(position)]:GetChildren()) do
+					if k.Name == "muffler" and k:FindFirstChild("Attachment") and k.Attachment:FindFirstChild("exhaustFumesBad") then
+						k.Attachment.exhaustFumesBad.Enabled = true
+					end
+				end
+				module:tweenToNext(npcType, position, workspace.cars[otherPlayerId][tostring(position)], value)
+			else
+				workspace.cars[otherPlayerId][tostring(position)]:SetPrimaryPartCFrame(value)
+			end
+		end
+		
+		if npcType and tostring(npcType) == "customer" then
+			if anim then 
+				if npcVisitingTable["customer"][position][anim] and not npcVisitingTable["customer"][position][anim].IsPlaying then
+					npcVisitingTable["customer"][position][anim]:Play()
+				end
+			end
+
+			if tweenToNext then
+				module:tweenToNext(npcType, position, workspace.npc[otherPlayerId][tostring(position)], value)		
+			else
+				workspace.npc[otherPlayerId][tostring(position)]:SetPrimaryPartCFrame(value)
+			end
+
+		end
+		
+		if npcType and tostring(npcType) == "worker" then
+			if npcVisitingTable["worker"][position]["npc"] and npcVisitingTable["worker"][position]["npc"]:FindFirstChild("AnimationController")  then -- ERROR PREVENTION
+				local animator = npcVisitingTable["worker"][position]["npc"].AnimationController:FindFirstChild("Animator")
+				if anim and npcVisitingTable["worker"][position][anim] then 
+					-- play anim on npc
+					for i,v in pairs(animator:GetPlayingAnimationTracks()) do
+						v:Stop()
+					end
+					npcVisitingTable["worker"][position][anim]:Play()
+					local npc = npcVisitingTable["worker"][position]["npc"]
+					if npc:FindFirstChild("broom") then
+						local particle = npc.broom.Attachment.exhaustFumesGood
+						if anim == "sweep" and npc then
+							npc.broom.Transparency = 0
+							npc.wrench.Transparency = 1
+							particle.Enabled = true
+						elseif anim == "wrench" and npc then
+							npc.wrench.Transparency = 0
+							npc.broom.Transparency = 1
+							particle.Enabled = false
+						elseif anim == "walk" and npc then
+							npc.wrench.Transparency = 1
+							npc.broom.Transparency = 1
+							particle.Enabled = false
+						end	
+					end
+				end
+				if tweenToNext then
+					module:tweenToNext(npcType, position, workspace.npcWorker[otherPlayerId][tostring(position)], value)
+
+				else
+					workspace.npcWorker[otherPlayerId][tostring(position)]:SetPrimaryPartCFrame(value)		
+				end 
+			end	
+		end
+	end
+end
+
+-- local handling of foreign assets
+function module:initializeClone(cloneTable, ownerId) 
+	 -- test
+	-- clear visiting Table if not already
+	playerVisiting = ownerId
+	npcVisitingTable = cloneTable
+		
+	local clonedTable = {}
+	local clonedTable = cloneTable
+	
+	-- create folder if doesnt exist 
+	if not workspace.npc:FindFirstChild(ownerId) then
+		local playerNpc = utils:newFolder(ownerId, workspace.npc)
+	end
+	if not workspace.npcWorker:FindFirstChild(ownerId) then
+		local playerNpc = utils:newFolder(ownerId, workspace.npcWorker)
+	end
+	if not workspace.cars:FindFirstChild(ownerId) then	
+		local playerCar = utils:newFolder(ownerId, workspace.cars)
+	end
+	if not workspace.placedItems:FindFirstChild(ownerId) then	
+		local playerCar = utils:newFolder(ownerId, workspace.placedItems)
+	end
+	
+	for _,k in ipairs(npcVisitingTable["car"]) do 
+		-- get object from repstorage and clone
+		if k ~= "x" then
+			local car = repStorage.cars[k["name"]]:Clone()
+			car:SetPrimaryPartCFrame(k["CFrame"])
+			car.Name = tostring(k["id"])
+			car:FindFirstChild("body").Color = k["color"]
+			gameUtils.setNpcHeight(car)
+			k["npc"] = car
+			car.Parent = workspace.cars[ownerId]		
+			for a,b in pairs(repStorage.Animations.carAnimation:GetChildren()) do -- add animations under animation controller
+				if b:IsA("Animation") then
+					local copy = b:Clone()
+					copy.Parent = car.AnimationController
+					local anim = car.AnimationController:LoadAnimation(copy)
+					npcVisitingTable["car"][k["id"]][b.Name] = anim -- add animTrack by name 
+				end
+			end
+			
+			--local floor = npcVisitingTable["car"][k["id"]]["floor"]  -- Ensure lift is in right position 
+			--local bay = npcVisitingTable["car"][k["id"]]["bay"]
+			--local garage = gameUtils.getGarageByUserId(ownerId)
+			--if garage and car.root then 
+			--	if (car.root.Position - garage.floors[floor][bay].liftTwo.top.Position).Magnitude < 3 then -- car is most likely up in the air 
+			--		garage.floors[floor][bay].liftTwo.lifts:SetPrimaryPartCFrame(garage.floors[floor][bay].liftTwo.top.CFrame)
+			--	else
+			--		garage.floors[floor][bay].liftTwo.lifts:SetPrimaryPartCFrame(garage.floors[floor][bay].liftTwo.base.CFrame)
+			--	end
+			--else
+			--	warn("could not retrieve player garage")
+			--end
+		end
+		
+		
+	end
+	
+	for _,k in ipairs(npcVisitingTable["customer"]) do 
+		-- get object from repstorage and clone
+		if k ~= "x" then
+			local npc = repStorage.npc[k["name"]]:Clone()
+			npc:SetPrimaryPartCFrame(k["CFrame"])
+			npc.Name = tostring(k["id"])
+			gameUtils.setNpcHeight(npc)
+			k["npc"] = npc
+			npc.Parent = workspace.npc[ownerId]		
+			for a,b in pairs(repStorage.Animations.npcAnimation:GetChildren()) do -- add animations under animation controller
+				if b:IsA("Animation") then
+					local copy = b:Clone()
+					copy.Parent = npc.AnimationController
+					local anim = npc.AnimationController:LoadAnimation(copy)
+					npcVisitingTable["customer"][k["id"]][b.Name] = anim -- add animTrack by name 
+				end
+			end
+		
+			-- set customer to init animation
+			if npcVisitingTable["customer"][k["id"]][k["animation"]] then
+				npcVisitingTable["customer"][k["id"]][k["animation"]]:Play()
+			end
+		end
+	end	
+	
+	for _,k in ipairs(npcVisitingTable["worker"]) do 
+		-- get object from repstorage and clone
+		local npc = repStorage.mechanicNpc[k["name"]]:Clone()
+		npc:SetPrimaryPartCFrame(k["CFrame"])
+		npc.Name = tostring(k["id"])
+		gameUtils.setNpcHeight(npc)
+		k["npc"] = npc
+		npc.Parent = workspace.npcWorker[ownerId]
+		for a,b in pairs(repStorage.Animations.npcAnimation:GetChildren()) do -- add animations under animation controller
+			if b:IsA("Animation") then
+				local copy = b:Clone()
+				copy.Parent = npc.AnimationController
+				local anim = npc.AnimationController:LoadAnimation(copy)
+				npcVisitingTable["worker"][k["id"]][b.Name] = anim -- add animTrack by name 
+			end
+		end
+		-- set worker to init animation
+		if npcVisitingTable["worker"][k["id"]][k["animation"]] then
+			npcVisitingTable["worker"][k["id"]][k["animation"]]:Play()
+		end
+		local anim = k["animation"]
+		if anim == "sweep" and npc then
+			npc.broom.Transparency = 0
+			npc.wrench.Transparency = 1
+		elseif anim == "wrench" and npc then
+			npc.wrench.Transparency = 0
+			npc.broom.Transparency = 1
+		elseif anim == "walk" and npc then
+			if npc and npc.wrench then -- ERROR REVIEW added ifs here in case used as desk worker
+				npc.wrench.Transparency = 1
+			end
+			if npc and npc.broom then -- ERROR REVIEW
+				npc.broom.Transparency = 1
+			end
+		end			
+	end		
+	module:updateGarageLifts(ownerId)
+end
+
+function module.removeClonedObjects(ownerId)
+	-- remove from workspace
+	if ownerId and workspace.cars:FindFirstChild(ownerId) and workspace.npc:FindFirstChild(ownerId) and workspace.npcWorker:FindFirstChild(ownerId) then
+		workspace.cars[ownerId]:Destroy()
+		workspace.npc[ownerId]:Destroy()
+		workspace.npcWorker[ownerId]:Destroy()
+	end
+end
+
+function module.rebirthUpdateClones(ownerId)
+	-- remove from workspace
+	for j,k in pairs(workspace.npc[tostring(ownerId)]:GetChildren()) do -- remove all client side objects from player
+		k:Destroy()
+	end
+	for j,k in pairs(workspace.npcWorker[tostring(ownerId)]:GetChildren()) do
+		k:Destroy()
+	end	
+	for j,k in pairs(workspace.placedItems[tostring(ownerId)]:GetChildren()) do
+		k:Destroy()
+	end		
+	for j,k in pairs(workspace.cars[tostring(ownerId)]:GetChildren()) do
+		k:Destroy()
+	end	
+end
+
+
+function module.remoteRemoveNpc(ownerId, npcType, position)
+	npcVisitingTable[npcType][position] = "x" -- setVisitingNpc to "x"
+	
+	if npcType == "car" then
+		if workspace.cars[ownerId]:FindFirstChild(tostring(position)) then
+			--delete from workspace
+			workspace.cars[ownerId][tostring(position)]:Destroy()
+		end
+	end
+end
+
+function module:remoteAddNpc(ownerId, npcType, npc) -- TODO fix this 
+	-- npc["id"] = #npcVisitingTable[npcType] + 1	--no need to convert "id"
+	--table.insert(npcVisitingTable[npcType], npc )--npc) -- dont even use table anymore for remote clients
+	npcVisitingTable[npcType][npc["id"]] = npc
+	
+	if not workspace.npc:FindFirstChild(ownerId) then
+		local playerNpc = utils:newFolder(ownerId, workspace.npc)
+	end
+	if not workspace.npcWorker:FindFirstChild(ownerId) then
+		local playerNpc = utils:newFolder(ownerId, workspace.npcWorker)
+	end
+	if not workspace.cars:FindFirstChild(ownerId) then	
+		local playerCar = utils:newFolder(ownerId, workspace.cars)
+	end	
+	
+	if npcType == "car" then
+		local localNpc = repStorage.cars[npc["name"]]:Clone()
+		localNpc:SetPrimaryPartCFrame(npc["CFrame"])
+		localNpc.Name = tostring(npc["id"])
+		gameUtils.setNpcHeight(localNpc)
+		npc["npc"] = localNpc
+		localNpc.body.Color = npc["color"]
+		localNpc.Parent = workspace.cars[ownerId]
+		for j,k in pairs(repStorage.Animations.carAnimation:GetChildren()) do -- add animations under animation controller
+			if k:IsA("Animation") then
+				local copy = k:Clone()
+				copy.Parent = localNpc.AnimationController
+				local anim = localNpc.AnimationController:LoadAnimation(copy)
+				npcVisitingTable["car"][npc["id"]][tostring(k.Name)] = anim -- add animTrack by name 
+			end
+		end
+	end
+	if npcType == "customer" then
+		local localNpc = repStorage.npc[npc["name"]]:Clone()
+		localNpc:SetPrimaryPartCFrame(npc["CFrame"])
+		localNpc.Name = tostring(npc["id"])
+		gameUtils.setNpcHeight(localNpc)
+		npc["npc"] = localNpc
+		localNpc.Parent = workspace.npc[ownerId]
+		for j,k in pairs(repStorage.Animations.npcAnimation:GetChildren()) do -- add animations under animation controller
+			if k:IsA("Animation") then
+				local copy = k:Clone()
+				copy.Parent = localNpc.AnimationController
+				local anim = localNpc.AnimationController:LoadAnimation(copy)
+				npcVisitingTable["customer"][npc["id"]][tostring(k.Name)] = anim -- add animTrack by name 
+			end
+		end
+	end
+	if npcType == "worker" then
+		local localNpc = repStorage.mechanicNpc[npc["name"]]:Clone()
+		gameUtils.setNpcHeight(localNpc)
+		local height = localNpc:GetAttribute("height")
+		localNpc:SetPrimaryPartCFrame(npc["CFrame"] - Vector3.new(0,5,0))
+		localNpc.Name = tostring(npc["id"])
+		npc["npc"] = localNpc
+		localNpc.Parent = workspace.npcWorker[ownerId]
+		for j,k in pairs(repStorage.Animations.npcAnimation:GetChildren()) do -- add animations under animation controller
+			if k:IsA("Animation") then
+				local copy = k:Clone()
+				copy.Parent = localNpc.AnimationController
+				local anim = localNpc.AnimationController:LoadAnimation(copy)
+				npcVisitingTable["worker"][npc["id"]][tostring(k.Name)] = anim -- add animTrack by name 
+			end
+		end
+	end		
+	-- fire npcTableServer
+end
+
+---- [[ Duplicated functions from others ]]
+function module:remoteFillCar(carId, userId)
+	local seatNum = 1
+	for _,k in ipairs(npcVisitingTable["customer"]) do
+
+		if k["carId"] and tonumber(k["carId"]) == tonumber(carId) then
+			local car = workspace.cars[userId][tostring(carId)]
+			local npc = workspace.npc[userId][tostring(k["id"])]
+			if k["seatPosition"] and k["seatPosition"] == "driver" then
+				npc:SetPrimaryPartCFrame(car.driver.CFrame + Vector3.new(0,npc.PrimaryPart.Size.Y/4.5),-(npc.PrimaryPart.Size.Z/2))
+				npc:SetPrimaryPartCFrame(car.driver.CFrame + Vector3.new(0,npc.PrimaryPart.Size.Y/4.5),-(npc.PrimaryPart.Size.Z/2))
+				local weld = utils:weldBetween(npc.PrimaryPart, car.driver)
+				npc.PrimaryPart.Anchored = false
+				npcVisitingTable["customer"][k["id"]]["drive"]:Play()
+				-- place in world TODO player folder
+			else 
+				npc:SetPrimaryPartCFrame(car[seatNum].CFrame + Vector3.new(0,npc.PrimaryPart.Size.Y/4.5),-(npc.PrimaryPart.Size.Z/2))
+				npc:SetPrimaryPartCFrame(car[seatNum].CFrame + Vector3.new(0,npc.PrimaryPart.Size.Y/4.5),-(npc.PrimaryPart.Size.Z/2))
+				local weld = utils:weldBetween(npc.PrimaryPart, car[seatNum])
+				npcVisitingTable["customer"][k["id"]]["sit"]:Play() -- TODO change to a ride animation
+				npc.PrimaryPart.Anchored = false
+				seatNum = seatNum + 1
+			end
+		end
+	end
+end
+
+function module:remoteEmptyCar(carId, userId) -- empty car for non garage owner players - replicated
+	local garage = 	gameUtils.getGarageByUserId(userId)
+	
+	local car = workspace.cars[tostring(userId)][tostring(carId)]
+	local bay = garage.floors[npcVisitingTable["car"][carId]["floor"]][npcVisitingTable["car"][carId]["bay"]]
+	local moveTo = bay.customerBayPosition.CFrame
+	if car then
+		local customerRealCount = 0
+		for j,k in pairs(npcVisitingTable["customer"]) do
+			if k["carId"] and tonumber(k["carId"]) == tonumber(carId) then
+				customerRealCount += 1
+				local npc = workspace.npc[userId][tostring(k["id"])]
+				-- stop animation
+				
+				--module.npcAnimUpdate(k, "idle")	-- TODO create update animation for others (module of updateing others character?)	
+				npc.PrimaryPart.Anchored = true
+				--npc.PrimaryPart.ManualWeld:Destroy()
+				if npc.PrimaryPart:FindFirstChild("ManualWeld") then
+					npc.PrimaryPart.ManualWeld.Part0 = nil
+				end
+				npcVisitingTable["customer"][k["id"]]["drive"]:Stop()
+				npcVisitingTable["customer"][k["id"]]["sit"]:Stop()				
+				npcVisitingTable["customer"][k["id"]]["idle"]:Play()
+				--module.heightPlacement(npc, bay.customerBayPosition)
+				npc:SetPrimaryPartCFrame(moveTo - Vector3.new(0,0,-3 * tonumber(customerRealCount - 1)))
+			end
+		end
+	else
+		return 
+	end
+end
+
+function module:updateGarageLifts(ownerId)
+	-- get garage by owner Id
+	local garage = gameUtils.getGarageByUserId(ownerId)
+	for j,k in pairs(garage.floors:GetChildren()) do
+		for a,b in pairs(k:GetChildren()) do
+			if b:FindFirstChild("liftTwo") then
+				if b.liftTwo:GetAttribute("state") == "up" then
+					b.liftTwo.lifts:SetPrimaryPartCFrame(b.liftTwo.top.CFrame)
+				end
+			end
+		end
+	end
+end
+
+function module:tweenToNext(npcType, position, npc,cframe)
+	local lastPosition = npc:GetPrimaryPartCFrame().Position
+	local nextPosition = cframe.Position
+	local tweenInfo
+	local tween
+	local goal = {}
+	goal.CFrame = cframe
+
+	local timeDist = (((nextPosition - lastPosition).Magnitude)/10)	
+
+	tweenInfo = TweenInfo.new(timeDist,Enum.EasingStyle.Linear,Enum.EasingDirection.Out,0,false,0)
+	tween = TweenService:Create(npc.PrimaryPart, tweenInfo, goal)	
+
+	tween:Play()
+end
+	
+-- [[ height setting for adding npc to spot]]
+function module.heightPlacement(npc, spot)
+	if npc:GetAttribute("height") then
+		local height = npc:GetAttribute("height")
+		local pos = spot
+
+		--if spot:FindFirstChild("heightPlus") then 
+		--	spot.Position = Vector3.new(spot.Position.X, height + spot.heightPlus.Value, spot.Position.Z)
+		--else
+			spot = spot - Vector3.new(0,height,0)
+		--end	
+	end
+	return spot
+end
+
+function module:remoteUpdateAnim(npcType, position, anim1, anim2) 
+	if anim1 then
+		npcVisitingTable[npcType][position][anim1]:Stop()	
+	end
+	if anim2 then 
+		npcVisitingTable[npcType][position][anim2]:Play()
+	end
+end
+
+npcTableRemote.onClientEvent:Connect(function(...)
+	local p = {...}
+	-- from server (duplicated assets from another player)
+	if p[1] == "remoteAddNpc" then
+		local ownerId = p[2]
+		local npcType = p[3]
+		local npc = p[4]
+		module:remoteAddNpc(ownerId, npcType, npc)
+	end
+	
+	if p[1] == "remoteRemoveNpc" then
+		local ownerId = p[2]
+		local npcType = p[3]
+		local position = p[4]
+		module.remoteRemoveNpc(ownerId, npcType, position)
+	end
+	
+	if p[1] == "initializeClone" then 
+		local cloneTable = p[2]
+		local ownerId = p[3]
+		if cloneTable then 
+			module:initializeClone(cloneTable, ownerId)
+		end
+	end
+	
+	if p[1] == "removeClones" then
+		local ownerId = p[2]
+		module.removeClonedObjects(ownerId)
+	end
+	
+	if p[1] == "updatesFromOthers" then
+		local otherId = p[2]
+		local npcType = p[3]
+		local position = p[4]
+		local key = p[5]
+		local value = p[6]
+		local anim = p[7]
+		local tweenToNext = p[8]
+		-- loop through player for updates on car, worker , customer
+		module:updatesFromOthers(otherId,npcType,position,key,value, anim, tweenToNext)
+	end
+end)
+
+return module
+
+
+-- reference
+--["npc"] = npc,
+--["name"] = name or npc.Name,
+--["flagChange"] = nil,
+--["position"] = Vector3.new(0,0,0),
+--["cframe"] = workspace.partGenerationSpot.CFrame,
+--["action"] = "waiting",
+--["moveTo"] = Vector3.new(0,0,0),
+--["animation"] = "waiting",
+--["seatPosition"] = nil,
+--["id"] =
